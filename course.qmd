@@ -1,0 +1,701 @@
+---
+title: "Merging different biologging data sources"
+author: "Benjamin Dupuis"
+format: 
+  html:
+    toc: true
+    embed-resources: true
+editor: visual
+---
+
+# Introduction
+
+In the previous classes, you have learned how to handle gps biologging data (projection, interpolation etc.)
+
+Here we will push further that knowledge by learning how to incorporate other data sources (*i.e.* depth data) to gps data.
+
+::: callout-important
+Aims of this practical :
+
+-   Code using the tidyverse functions and packages
+
+-   Import in R a github dataset
+
+-   Be independent on how to use *sf* and *adehabitatLT* to clean and temporally regularize GPS tracks
+
+-   Combine data with different temporal resolution
+
+-   Basic spatial analysis of covariate
+:::
+
+# 1. GPS data cleaning
+
+## Step 1 : Import dataset
+
+Numerous biologging dataset are available online (see <https://www.movebank.org/> or <https://datadryad.org/> for instance). Here, we will use biologging data collected on female harbour seals in Scotland. You can find these data on the following Github repository : <https://github.com/bendps/biologging_course_merging_data>
+
+To download data, you simply need to copy paste its URL (seal_gps_data.csv \> RAW \> copy URL) and use `readr::read_csv` to fetch it. For now, we will only download the gps data.
+
+::: callout-tip
+*Readr* is part of the Tidyverse "metapackage", like *ggplot2*, *dplyr*, *lubridate* etc. In the following course, we will mostly rely on tidyverse functions because they tend to more efficient than base R functions (like `read.csv`)
+:::
+
+::: callout-tip
+Remember as a good practice to always clean your environment when starting a new script. This will avoid filling too much RAM and calling object stored in your environment from other scripts.
+:::
+
+```{r}
+#| label: get gps
+#| message: false
+
+#clean environment
+rm(list = ls())
+gc()
+
+#load packages
+library(tidyverse)
+library(sf)
+
+#fetch dataset
+gps_url <- "https://raw.githubusercontent.com/bendps/biologging_course_merging_data/refs/heads/main/seal_gps_data.csv"
+
+my_gps <- read_csv(url(gps_url))
+glimpse(my_gps)
+```
+
+You now have a tibble containing gps data and timestamps for 3 individuals.
+
+## Step 2 : Cleaning GPS data
+
+Before plotting any map, we need to make sure that our data are clean. GPS loggers can sometime generate obviously wrong points (hundreds of km away from the actual animal). A simple way to spot these points is by simply calculating the speed between 2 consecutive locations. If this speed is higher than the maximum speed of your species, then you need to remove those points to avoid interfering with your analyses.
+
+Knowing that overall, a good maximum speed for pinnipeds is 2.5 m/s. Try writing a script to filter unlikely locations based on speed. To do that, you will need to :
+
+-   Convert your data frame to a spatial point data frame using `sf::st_as_sf()` and set the GPS CRS using `sf::st_crs()` and `EPSG:4326`. *SF* is the standard package for handling spatial data.
+
+-   Calculate the duration (seconds) between location T and T-1 using `dplyr::mutate()` and `lag()`.
+
+-   Calculate the distance (meters) between location T and T-1 using `sf::st_distance()`
+
+-   Compute the speed for each location
+
+-   Before checking if you have any abnormal speed, remember that your data frame contains 3 different tracks. You will also need to remove the speed, distance and time interval value for the first GPS point of each seal. Use again `lag()` to find the first row of each seal track. Combine it with `ifelse()` to remove the values.
+
+::: callout-tip
+## ifelse statements
+
+`ifelse()` allows you to change a value based on a statement. Its syntax is `ifelse(statement, value when TRUE, value when FALSE)`. If you refer to vectors or data frame columns in the statement (*e.g.* `df$colA > df$colB`), `ifelse()` will compare every pair of values.
+:::
+
+-   Filter the ones with a speed \> 2.5 m/s.
+    -   **Bonus step:** do this filter inside a `while()` loop which will re-compute new speed, distance and time values after filtering locations based on the speed value.
+
+::: callout-tip
+## Using lag() and dplyr::mutate()
+
+To code these last 3 points within the *Tidyverse* framework, you will need to use `lag()` which will compare the row *i* of your data frame with the row *i-1* and`dplyr::mutate` which can compute a new column based on existing ones in a data frame.
+
+here is a small example :
+
+```{r}
+#| label: lag example
+#| message: false
+sample_data <- tibble(id = rep(c("A", "B"), 5),
+                      value = c(1:10))
+
+#tidyverse version
+sample_data <- sample_data %>%
+  mutate(new_val = value - lag(value))
+
+print(sample_data)
+
+#base r version
+sample_data$new_val <- sample_data$value - lag(sample_data$value)
+```
+
+You will notice that *Tidyverse* functions often use the pipe (`%>%`). This operator allows you to specify the data frame on which you are working. Its keyboard shortcut is `ctrl` + `shift` + `M`.
+:::
+
+::: callout-important
+If you get overwhelmed, remember to check the help page of a function (*e.g.* `?mutate()`).
+:::
+
+::: {.callout-note collapse="true"}
+### Step 2 solution
+
+First we compute the metrics
+
+```{r}
+#| label: compute speed
+#| message: false
+
+sf_gps <- st_as_sf(my_gps, coords = c("longitude", "latitude"))
+st_crs(sf_gps) <- 4326 #set gps CRS
+
+sf_gps <- sf_gps %>%
+  mutate(
+    distance_to_prev = as.numeric(st_distance(geometry, lag(geometry), by_element = TRUE)), # compute distances in meters
+    interval_secs = as.numeric(difftime(timestamp, lag(timestamp), units = "secs")), #compute time interval in seconds
+    speed = distance_to_prev/interval_secs # Compute speed in m.s
+  )
+
+#remove speed, time and distance when switching from one individual to another
+sf_gps$distance_to_prev <- ifelse(sf_gps$id != lag(sf_gps$id),
+                                       NA,
+                                       sf_gps$distance_to_prev)
+sf_gps$interval_secs <- ifelse(sf_gps$id != lag(sf_gps$id),
+                                       NA,
+                                       sf_gps$interval_secs)
+sf_gps$speed <- ifelse(sf_gps$id != lag(sf_gps$id),
+                                       NA,
+                                       sf_gps$speed)
+
+
+```
+
+We now see that we have 6 points with speed \> 2.5 m/s and up to 290.15 m/s. Seems a bit high for a seal...
+
+```{r}
+#| label: check speed
+#| message: false
+
+summary(sf_gps$speed)
+length(which(sf_gps$speed > 2.5))
+```
+
+Let's remove these points
+
+```{r}
+#| label: filter speed
+#| message: false
+
+while (any(sf_gps$speed > 2.5, na.rm = T)) {
+  sf_gps <- sf_gps %>%
+    filter(speed < 2.5) # Filter out points with speed > 2.5 m/s
+  
+  #compute again speed, time and distance
+  sf_gps <- sf_gps %>%
+    mutate(
+      distance_to_prev = as.numeric(st_distance(geometry, lag(geometry), by_element = TRUE)),
+      interval_secs = as.numeric(difftime(timestamp, lag(timestamp), units = "secs")), 
+      speed = distance_to_prev/interval_secs
+    )
+  
+  sf_gps$distance_to_prev <- ifelse(sf_gps$id != lag(sf_gps$id),
+                                    NA,
+                                    sf_gps$distance_to_prev)
+  sf_gps$interval_secs <- ifelse(sf_gps$id != lag(sf_gps$id),
+                                 NA,
+                                 sf_gps$interval_secs)
+  sf_gps$speed <- ifelse(sf_gps$id != lag(sf_gps$id),
+                         NA,
+                         sf_gps$speed)
+  
+}
+
+summary(sf_gps$speed)
+length(which(sf_gps$speed > 2.5))
+```
+:::
+
+## Step 3 : Interpolating tracks with a constant time step
+
+For multiple reasons, GPS data collected by loggers do not display a constant time step between each location. With diving animals for instance, a logger cannot record a GPS location when underwater because it won't be able to reach satellite signals.
+
+```{r}
+#| label: check time step
+#| message: false
+
+print(summary(sf_gps$interval_secs))
+```
+
+If we check this time step on our data, we see that there is at least 300 secs (5 minutes) between 2 GPS locations. The average time step is around 10 minutes (648 secs) and goes up to 15061 secs (\~4 hours)!
+
+Finding the right cutoff for interpolation can be tricky. Here, we will use the 90th percentile of our time step, which is around 20 minutes.
+
+```{r}
+#| label: interpolation cutoff
+#| message: false
+
+print(quantile(sf_gps$interval_secs, 0.9, na.rm = T))
+```
+
+Our goal is now to regularize our GPS track to have one location every 20 minutes. To do so, use the *adehabitatLT* R package to:
+
+-   Transform your data frame into an ltraj object using `as.ltraj()`. Using `sf::st_coordinates()` you can extract the x and y coordinates of your tracks.
+
+-   Interpolate the tracks to have one location every 20 minutes using `redisltraj()`.
+
+-   Convert back your ltraj object to a sf data frame using `adehabitatLT::ld()` and `sf::st_as_sf()`.
+
+    -   You want to do that because ltraj object are specific to *adehabitatLT* and therefore super annoying if you want to plot maps, or add a depth information to your track as we want to here.
+
+::: {.callout-note collapse="true"}
+### Step 3 solution
+
+First we convert to ltraj.
+
+```{r}
+#| label: go to ltraj
+#| message: false
+
+library(adehabitatLT)
+
+# Create an ltraj object
+ltraj_data <- as.ltraj(
+  xy = st_coordinates(sf_gps), # Coordinates (x, y)
+  date = sf_gps$timestamp, # Timestamps
+  id = sf_gps$id, # Animal IDs
+  typeII = TRUE # TRUE if timestamps are provided, FALSE otherwise
+)
+
+# Print the ltraj object
+print(ltraj_data)
+```
+
+As you can see from the output, we have variable time step between our locations. Let's use redisltraj to interpolate our tracks
+
+```{r}
+#| label: interpolating track
+#| message: false
+
+interpolated_traj <- redisltraj(ltraj_data, 20*60, type="time")
+plot(interpolated_traj)
+```
+
+We know have tracks with regular time step. Let's convert it back to a sf data frame.
+
+```{r}
+#| label: back to sf
+#| message: false
+
+sf_traj <- st_as_sf(ld(interpolated_traj), coords = c("x", "y"), crs = 4326) # Change CRS if needed
+print(sf_traj)
+```
+:::
+
+## Step 4 : Mapping our track
+
+Now that we are sure that our GPS dataset is clean, we can finally map it. Because we use *SF*, we can easily plot our data with `ggplot2::geom_sf`.
+
+::: callout-tip
+## Mapping with ggplot2 and sf
+
+We can also add a shapefile (i.e. mask) of the coastline. You can find it online on the github repository. Download the "Costaline_UTM30" folder and load the `.shp` file in R using `sf::st_read()`.
+
+Another useful SF function is `sf::st_bbox` which compute the x and y limits of your spatial data. We can then use it inside our ggplot map with `coord_sf()` to specify the limits of our study area.
+
+When plotting with ggplot2, remember that each line is a layer, and each layer is plotted on top of the previous one.
+
+Finally, *ggspatial* package allows you to easily add annotation scale and north arrow.
+:::
+
+```{r}
+#| label: mapping
+#| message: false
+
+library(ggspatial)
+library(viridis)
+
+bbox <- st_bbox(sf_traj)
+coastline <- st_read("data/Coastline_UTM30/Coastline_UTM30.shp")
+
+my_map <- ggplot() +
+  geom_sf(data = coastline, fill= "antiquewhite") + #coastline shapefile
+  geom_sf(data = sf_traj, aes(col = id)) + #gps data
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), 
+           ylim = c(bbox["ymin"], bbox["ymax"]),
+           crs = st_crs("EPSG:4277")) + #study area limits
+  annotation_scale(location = "br", width_hint = 0.5) + #annotation scale and north arrow
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         style = north_arrow_fancy_orienteering) +
+  scale_color_viridis(discrete = T) + #viridis is colourblind friendly
+  theme_bw() +
+  theme(panel.grid.major = element_line(color = gray(.5),
+                                        linetype = "dashed",
+                                        linewidth = 0.5),
+        panel.background = element_rect(fill = "aliceblue"))
+
+print(my_map)
+```
+
+# 2. Depth data
+
+## Step 5 : Import
+
+Now, we want to get depth data. Adapt **step 1** code to fetch `seal_dive_data.csv` and save it into `my_depth`.
+
+::: callout-important
+Do not run the lines for cleaning your environment or you will lose your gps data.
+:::
+
+::: {.callout-note collapse="true"}
+### Step 5 solution
+
+```{r}
+#| label: get depth data
+#| message: false
+
+#fetch dataset
+depth_url <- "https://raw.githubusercontent.com/bendps/biologging_course_merging_data/refs/heads/main/seal_dive_data.csv"
+
+my_depth <- read_csv(url(depth_url))
+```
+:::
+
+You should now have a data frame looking like this :
+
+```{r}
+#| label: show depth
+#| message: false
+
+
+glimpse(my_depth)
+```
+
+## Step 6 : Explore depth data
+
+As you can see, this data frame has the same `id` column as our gps data. Here, each row summarize one dive. Some loggers like the one here do not record detailed information of diving data, and summarize it with key values to save power and memory. Here we see that the logger recorded the timestamps of when the seal started and ended a dive. We also get the maximum depth reached during that dive.
+
+When dealing with new data, a good practice is to explore it, through plots or using `summary()`, `table()`, or `dplyr::group_by()`.
+
+Try to find for each seal :
+
+-   The overall maximum depth it reached
+
+::: callout-tip
+## Using group_by() and summarise()
+
+You can use `dplyr::group_by` and `dplyr::summarise()`. `group_by()` allows you to group rows based on one of the columns values. After `group_by()`, using `summarise()` will allow you to calculate new variables for your groups.
+:::
+
+-   The total average duration of its dive
+
+::: callout-tip
+Remember you have learned how to compute time interval in **step 2**
+:::
+
+::: {.callout-note collapse="true"}
+### Step 6 solution - maximum depth
+
+```{r}
+#| label: get max depth
+#| message: false
+
+my_depth %>%
+  group_by(id) %>%
+  summarise(max_depth = max(max_depth))
+```
+:::
+
+::: {.callout-note collapse="true"}
+### Step 6 solution - average dive duration
+
+```{r}
+#| label: get dive dur
+#| message: false
+
+my_depth %>% 
+  mutate(dive_duration_sec = as.numeric(difftime(dive_end, dive_start, units = "secs"))) %>% 
+  group_by(id) %>% 
+  summarise(mean_div_dur_sec = mean(dive_duration_sec))
+```
+:::
+
+As I said, plots are also a good way to explore your data. Here let's try to plot the dive profiles of our 3 individuals (time \~ depth)!
+
+Code a `ggplot()` with dive start timestamps on the x-axis, and depth on the y-axis. Give a different colour to each individuals.
+
+**Bonus step** : for clarity, you can try using `facet_wrap()` in your ggplot so that profiles do not overlap.
+
+::: {.callout-note collapse="true"}
+### Step 6 solution - plot
+
+```{r}
+#| label: plot dive
+#| message: false
+
+ggplot() +
+  geom_point(data = my_depth, aes(x = dive_start, y = -max_depth, col = id)) +
+  facet_wrap(~id) +
+  theme_bw() +
+  labs(x = "Time", y = "Depth")
+```
+:::
+
+# 3. Merging channels
+
+We now have clean GPS and depth data, but both have a different temporal resolution. We have spatial data every 20 minutes, and depth data for each dive.
+
+To merge these two sources, we again need to summarize the higher resolution one (*i.e.* dives) to fit the coarser resolution data (*i.e*. gps). To do so, we can take advantage of having IDs and timestamps for both datasets.
+
+In R, a simple way to perform such task is too use a `for()` loop combined with `dplyr::filter()`.
+
+::: callout-tip
+## for() loops
+
+In biology, we often work with datasets—for example, a list of different species, sample measurements, or genetic sequences. Instead of manually analyzing each data point, we can use a `for()` loop to repeat the same operation on every item in a dataset.
+
+Example:
+
+```{r}
+#| label: for loop
+#| message: false
+
+species <- c("Adélie Penguin", "Emperor Penguin", "Chinstrap Penguin")
+
+for (s in species) {
+  print(s)
+}
+```
+:::
+
+::: callout-tip
+## dplyr::filter()
+
+`dplyr::filter()` allows to filter rows of a data frame based on one or several statements. For instance we can filter depth data to only keep to ones belonging to Huey and with maximum depth deeper than 50 m.
+
+```{r}
+#| label: filter
+#| message: false
+
+my_depth %>% 
+  filter(id == "huey" & max_depth > 20)
+```
+:::
+
+Here, for each row of `sf_traj`, we want to add the average dive depth of the seal.
+
+::: {.callout-note collapse="true"}
+## Merging depth and GPS solution
+
+First, we need to initialize our new column with `NA`s.
+
+```{r}
+#| label: init
+#| message: false
+
+sf_traj$mean_dive_depth <- NA
+```
+
+Then we create of for() loop which will go through all the rows of our GPS data frame one by one.
+
+We ask this for loop to find all the data from all the dives that happened between the timestamp of a GPS locations and the one before (so over a 20 minutes interval).
+
+Because of that, we won't be able to compute average dive depth for the first location of a track. To exclude those from the loop :
+
+-   We make it spanning for the second line of the GPS data frame to the last one (`2:nrow(sf_traj)`).
+
+-   We compute an average dive depth only if the 2 consecutive GPS locations belong to the same individual.
+
+Finally, during some interval, no dive were recorded. With our current code, these location have `NA` depth values. We change these to 0.
+
+```{r}
+#| label: merge channel max depth
+#| message: false
+
+for(i in 2:nrow(sf_traj)){
+  if(!is.na(sf_traj$dt[i])){
+    #get time limits and id
+    t_start <- sf_traj$date[i-1]
+    t_end <- sf_traj$date[i]
+    my_id <- sf_traj$id[i]
+    
+    #filter depth data
+    temp_depth <- my_depth %>%
+      filter(id == my_id & dive_start >= t_start & dive_start <= t_end) %>% 
+      filter(dive_end >= t_start & dive_end <= t_end )
+    
+    #paste value in the GPS data frame
+    sf_traj$mean_dive_depth[i] <- mean(temp_depth$max_depth)
+  }
+}
+
+#Change NAs to 0 when no dive were recorded.
+sf_traj$mean_dive_depth <- ifelse(is.na(sf_traj$mean_dive_depth), 0, sf_traj$mean_dive_depth)
+
+
+```
+:::
+
+Now that you now how to merge different data streams, adapt the previous script to also compute the total time spent diving over a 20 minutes interval.
+
+::: {.callout-note collapse="true"}
+## Get time spent diving solution
+
+```{r}
+#| label: merge channel max depth and time
+#| message: false
+
+sf_traj$mean_dive_depth <- NA
+sf_traj$diving_duration_sec <- NA
+
+my_depth <- my_depth %>% 
+  mutate(dive_duration_sec = as.numeric(difftime(dive_end, dive_start, units = "secs")))
+
+for(i in 2:nrow(sf_traj)){
+  if(!is.na(sf_traj$dt[i])){
+    #get time limits and id
+    t_start <- sf_traj$date[i-1]
+    t_end <- sf_traj$date[i]
+    my_id <- sf_traj$id[i]
+    
+    #filter depth data
+    temp_depth <- my_depth %>%
+      filter(id == my_id & dive_start >= t_start & dive_start <= t_end) %>% 
+      filter(dive_end >= t_start & dive_end <= t_end )
+    
+    #paste value in the GPS data frame
+    sf_traj$mean_dive_depth[i] <- mean(temp_depth$max_depth)
+    sf_traj$diving_duration_sec[i] <- sum(temp_depth$dive_duration_sec)
+  }
+}
+
+#Change NAs to 0 when no dive were recorded.
+sf_traj$mean_dive_depth <- ifelse(is.na(sf_traj$mean_dive_depth), 0, sf_traj$mean_dive_depth)
+sf_traj$diving_duration_sec <- ifelse(is.na(sf_traj$diving_duration_sec), 0, sf_traj$diving_duration_sec)
+```
+:::
+
+We now have our final data frame, with combined depth and GPS data!
+
+Let's explore it a bit. Try to generate a new map where the size of each point would be dependent on the diving depth.
+
+::: callout-tip
+Re-use the code of the map written at step 4
+:::
+
+::: {.callout-note collapse="true"}
+## Mapping diving depth solution
+
+```{r}
+#| label: map diving depth
+#| message: false
+
+my_map <- ggplot() +
+  geom_sf(data = coastline, fill= "antiquewhite") + #coastline shapefile
+  geom_path(data = sf_traj,
+            aes(x = st_coordinates(sf_traj)[,1],
+                y = st_coordinates(sf_traj)[,2],
+                col = id)) +
+  geom_sf(data = sf_traj, aes(col = id, size = mean_dive_depth), alpha = 0.5) + #gps data
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), 
+           ylim = c(bbox["ymin"], bbox["ymax"]),
+           crs = st_crs("EPSG:4277")) + #study area limits
+  annotation_scale(location = "br", width_hint = 0.5) + #annotation scale and north arrow
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         style = north_arrow_fancy_orienteering) +
+  scale_color_viridis(discrete = T) + #viridis is colourblind friendly
+  theme_bw() +
+  theme(panel.grid.major = element_line(color = gray(.5),
+                                        linetype = "dashed",
+                                        linewidth = 0.5),
+        panel.background = element_rect(fill = "aliceblue")) +
+  labs(size = "Average diving depth", col = "ID", x = "Longitude", y = "Latitude") +
+  facet_wrap(~id)
+
+print(my_map)
+```
+:::
+
+From this map, we can already see some patterns in the seals diving behaviour. Diving depth seems to increase as they go further from the coast and breeding site.
+
+::: callout-tip
+Attaching variables to spatial coordinates is also often used in Hidden Markov Models (HMMs, see tutorial n°3) to classify behaviours.
+:::
+
+# 4. Introduction to spatial analyses
+
+This simple visual analysis is often not enough. A common way to analyze such data is to convert tracks into "rasters".
+
+::: callout-tip
+## Rasters
+
+A raster in R is like a digital image made up of tiny squares (pixels), where each pixel has a value that represents something in a specific geographic area. In biology and ecology, raster data is often used for spatial data—things like temperature, vegetation cover, or sea ice concentration over a region. These grids can be stored in raster objects in R and analyzed with the **terra** package
+
+```{r}
+#| label: raster
+#| message: false
+
+library(terra)
+
+# Create a blank raster with 10 rows and 10 columns
+r <- rast(nrows = 10, ncols = 10, xmin = 0, xmax = 100, ymin = 0, ymax = 100)
+
+# Fill it with random temperature values
+values(r) <- runif(ncell(r), min = -10, max = 30)  
+
+# Plot the raster
+plot(r, main = "Temperature Map (°C)")
+
+```
+:::
+
+To do so, we first need to change the projection of our data. The UTM projection uses meters as units instead of degrees. We need this to specify the spatial resolution of our grid in meters (note that you could do it in degrees, it is just less intuitive). The EPSG code for Europe is 25828
+
+```{r}
+#| label: reproject
+#| message: false
+
+sf_traj <- st_transform(sf_traj, 25828) # UTM projection, change based on location
+bbox <- st_bbox(sf_traj)
+coastline <- st_transform(coastline, 25828)
+```
+
+Then we use terra::rast() to create a raster covering the extent of our GPS locations, and ask for a resolution of 1km².
+
+```{r}
+#| label: rasterize
+#| message: false
+
+# Define a raster grid
+r <- rast(ext(sf_traj), resolution = 1000)
+```
+
+Once created, we can fill it with our values. Let's say we want to know in each cell the average dive depth.
+
+```{r}
+#| label: fill raster
+#| message: false
+
+r_mean <- rasterize(vect(sf_traj), r, field = "mean_dive_depth", fun = mean)
+plot(r_mean)
+
+```
+
+We know have a raster showing diving behaviour of our seals in our study areas. To map it in a cleaner way. We need to convert it back to a data frame as ggplot doesn't handle rasters.
+
+```{r}
+#| label: plot raster
+#| message: false
+
+df_raster <- as.data.frame(r_mean, xy = TRUE, na.rm = TRUE)
+
+ggplot() +
+  geom_tile(data = df_raster, aes(x = x, y = y, fill = mean)) + 
+  geom_sf(data = coastline, fill= "antiquewhite") + #coastline shapefile
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), 
+           ylim = c(bbox["ymin"], bbox["ymax"])) + #study area limits
+  annotation_scale(location = "br", width_hint = 0.5) + #annotation scale and north arrow
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         style = north_arrow_fancy_orienteering) +
+  scale_fill_viridis(discrete = F) + #viridis is colourblind friendly
+  theme_bw() +
+  theme(panel.grid.major = element_line(color = gray(.5),
+                                        linetype = "dashed",
+                                        linewidth = 0.5),
+        panel.background = element_rect(fill = "aliceblue")) +
+  labs(x = "Longitude", y = "Latitude", fill = "Average dive depth")
+```
+
+::: callout-tip
+Once rasterized, spatial data can be easily analyzed in R. We could for instance study the effect of the environment of the dive depth of seals by downloading online a raster of the same resolution containing sea surface temperature, chlA concentration or any other variable for instance. Such data are freely available on <https://data.marine.copernicus.eu/products>
+:::
+
+## Sources
+
+-   Data sample from "Iorio-Merlo, Virginia et al. (2022), Prey encounters and spatial memory influence use of foraging patches in a marine central place forager, Proceedings of the Royal Society B: Biological Sciences" - <https://doi.org/10.1098/rspb.2021.2261>
+
+-   dplyr cheat sheet : <https://nyu-cdsc.github.io/learningr/assets/data-transformation.pdf>
+
+-   mapping in R : <https://r-spatial.org/r/2018/10/25/ggplot2-sf.html>
